@@ -181,7 +181,7 @@ export function logGeneratedImages(provider: string, requestId: string, images: 
  * 记录图片生成完成（汇总信息）
  */
 export function logImageGenerationComplete(provider: string, requestId: string, count: number, duration: number): void {
-  writeLog(LogLevel.INFO, provider, `✅ 图片生成完成 (${requestId}): ${count} 张图片, 耗时 ${duration}ms`);
+  writeLog(LogLevel.INFO, provider, `✅ 图片生成完成 (${requestId}): ${count} 张图片, 耗时 ${(duration / 1000).toFixed(2)}s`);
 }
 
 /**

@@ -19,5 +19,6 @@ EXPOSE 10001
 # 运行应用
 # --allow-net: 允许网络访问（调用火山引擎 API）
 # --allow-env: 允许读取环境变量
+# --allow-read: 允许读取文件（版本号等）
 # --allow-write: 允许写入日志文件
-CMD ["run", "--allow-net", "--allow-env", "--allow-write", "main.ts"]
+CMD ["run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "main.ts"]

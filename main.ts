@@ -1,5 +1,5 @@
-// 四合一图像生成 API 中转服务
-// 支持：火山引擎 (VolcEngine)、Gitee (模力方舟)、ModelScope (魔塔)、Hugging Face
+// 多合一图像生成 API 中转服务
+// 支持：火山引擎 (VolcEngine)、Gitee (模力方舟)、ModelScope (魔搭)、Hugging Face
 // 路由策略：根据 API Key 格式自动分发
 
 // ================= 导入日志模块 =================
@@ -104,10 +104,13 @@ function detectProvider(apiKey: string): Provider {
 
 function extractPromptAndImages(messages: Message[]): { prompt: string; images: string[] } {
   let prompt = "";
-  let images: string[] = [];
+  const currentImages: string[] = [];
+  let lastUserIndex = -1;
 
+  // 1. 提取最后一条用户消息的内容
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
+      lastUserIndex = i;
       const userContent = messages[i].content;
       if (typeof userContent === "string") {
         prompt = userContent;
@@ -115,15 +118,56 @@ function extractPromptAndImages(messages: Message[]): { prompt: string; images: 
         const textItem = userContent.find((item: MessageContentItem) => item.type === "text") as TextContentItem | undefined;
         prompt = textItem?.text || "";
         
-        images = userContent
+        const imgs = userContent
           .filter((item: MessageContentItem): item is ImageUrlContentItem => item.type === "image_url")
           .map((item: ImageUrlContentItem) => item.image_url?.url || "")
           .filter(Boolean);
+        currentImages.push(...imgs);
       }
       break;
     }
   }
-  return { prompt, images };
+
+  // 2. 追溯历史图片（实现上下文关联与多图融合）
+  const historicalImages: string[] = [];
+  if (lastUserIndex !== -1) {
+    // 从当前消息的前一条开始向前找，找到最近的一个包含图片的对话块
+    for (let i = lastUserIndex - 1; i >= 0; i--) {
+      const content = messages[i].content;
+      let foundInMsg: string[] = [];
+      
+      if (typeof content === "string") {
+        // 匹配 Markdown 图片: ![alt](url) 或 ![alt](data:image/...)
+        // 同时支持 URL 和 Base64 格式
+        const matches = content.matchAll(/!\[.*?\]\(((?:https?:\/\/|data:image\/)[^\)]+)\)/g);
+        for (const match of matches) {
+          foundInMsg.push(match[1]);
+        }
+      } else if (Array.isArray(content)) {
+        foundInMsg = content
+          .filter((item: MessageContentItem): item is ImageUrlContentItem => item.type === "image_url")
+          .map((item: ImageUrlContentItem) => item.image_url?.url || "")
+          .filter(Boolean);
+      }
+      
+      if (foundInMsg.length > 0) {
+        historicalImages.push(...foundInMsg);
+        debug("Router", `发现历史参考图: ${foundInMsg.length}张`);
+        break; // 只取最近的一次图片上下文
+      }
+    }
+  }
+
+  // 3. 按照“本次图片优先，历史图片补充”的原则合并
+  // 这样如果是 P 图场景，本次上传的“刺客”就是图1，历史的“美女”就是图2
+  const finalImages = [...currentImages];
+  for (const img of historicalImages) {
+    if (!finalImages.includes(img)) {
+      finalImages.push(img);
+    }
+  }
+
+  return { prompt, images: finalImages };
 }
 
 // ================= 超时控制辅助函数 =================
@@ -154,8 +198,49 @@ async function fetchWithTimeout(
   }
 }
 
+// ================= 辅助函数 =================
+
+/**
+ * 将图片 URL 下载并转换为 Base64 格式
+ * @param url 图片 URL
+ * @returns Base64 编码的图片数据（不含 data:image/xxx;base64, 前缀）
+ */
+async function urlToBase64(url: string): Promise<{ base64: string; mimeType: string }> {
+  const response = await fetchWithTimeout(url, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`下载图片失败: ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
+  
+  // 将二进制数据转换为 Base64
+  let binary = "";
+  for (let i = 0; i < uint8Array.length; i++) {
+    binary += String.fromCharCode(uint8Array[i]);
+  }
+  const base64 = btoa(binary);
+  
+  // 获取 MIME 类型
+  const contentType = response.headers.get("content-type") || "image/png";
+  const mimeType = contentType.split(";")[0].trim();
+  
+  return { base64, mimeType };
+}
+
 // ================= 渠道处理函数 =================
 
+/**
+ * 火山引擎（豆包）图片生成处理函数
+ *
+ * 【文生图】纯文字生成图片
+ *   - 默认尺寸：VolcEngineConfig.defaultSize (4096x4096)
+ *   - 支持模型：doubao-seedream-4-0-250828, doubao-seedream-4-5-251128
+ *
+ * 【图生图】参考图片 + 文字生成图片
+ *   - 默认尺寸：VolcEngineConfig.defaultEditSize (4096x4096)
+ *   - 支持传入图片 URL 或 Base64
+ *   - 图片会作为参考进行风格迁移或内容修改
+ */
 async function handleVolcEngine(
   apiKey: string,
   reqBody: ChatRequest,
@@ -164,32 +249,59 @@ async function handleVolcEngine(
   requestId: string
 ): Promise<string> {
   const startTime = Date.now();
-  logApiCallStart("VolcEngine", "generate_image");
+  const hasImages = images.length > 0;
+  const apiType = hasImages ? "image_edit" : "generate_image";
+  
+  logApiCallStart("VolcEngine", apiType);
   
   // 记录完整 Prompt
   logFullPrompt("VolcEngine", requestId, prompt);
   
-  // 记录输入图片
-  logInputImages("VolcEngine", requestId, images);
+  // 记录输入图片（如果有）
+  if (hasImages) {
+    logInputImages("VolcEngine", requestId, images);
+  }
+
+  // 处理输入图片：默认转换为 Base64 格式以实现“永存”
+  const processedImages = await Promise.all(images.map(async (img) => {
+    if (img.startsWith("data:image/")) return img;
+    if (img.startsWith("http")) {
+      try {
+        const { base64, mimeType } = await urlToBase64(img);
+        return `data:${mimeType};base64,${base64}`;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        warn("VolcEngine", `图片下载并转换为 Base64 失败，回退到 URL: ${msg}`);
+        return img;
+      }
+    }
+    return img;
+  }));
   
   // 使用配置中的默认模型，支持多模型
   const model = reqBody.model && VolcEngineConfig.supportedModels.includes(reqBody.model)
     ? reqBody.model
     : VolcEngineConfig.defaultModel;
-  const size = reqBody.size || "4096x4096";
+  
+  // 根据是否有输入图片选择不同的默认尺寸
+  const size = reqBody.size || (hasImages ? VolcEngineConfig.defaultEditSize : VolcEngineConfig.defaultSize);
   
   // 记录生成开始
   logImageGenerationStart("VolcEngine", requestId, model, size, prompt.length);
   
+  // 构建符合最新规范的请求体 (使用展开运算符避免 any 类型)
   const arkRequest = {
     model: model,
     prompt: prompt || "A beautiful scenery",
-    image: images,
-    response_format: "url",
+    // 默认使用 b64_json 以实现图片永存，保留 url 作为备用
+    response_format: (reqBody["response_format"] as string) || "b64_json",
     size: size,
-    seed: -1,
-    stream: false,
     watermark: false,
+    // 根据图片数量动态添加参数
+    ...(hasImages ? {
+      image: processedImages.length === 1 ? processedImages[0] : processedImages,
+      ...(processedImages.length > 1 ? { sequential_image_generation: "disabled" } : {})
+    } : {})
   };
 
   const response = await fetchWithTimeout(VolcEngineConfig.apiUrl, {
@@ -216,97 +328,229 @@ async function handleVolcEngine(
   logGeneratedImages("VolcEngine", requestId, data.data || []);
   
   const duration = Date.now() - startTime;
-  const imageCount = data.data?.length || 0;
+  const imageData = data.data || [];
+  const imageCount = imageData.length;
   logImageGenerationComplete("VolcEngine", requestId, imageCount, duration);
   
-  const result = data.data?.map((img: { url: string }) => `![Generated Image](${img.url})`).join("\n\n") || "图片生成失败";
+  // 智能处理返回结果：优先使用 Base64 嵌入以实现“永存”
+  const result = imageData.map((img: { url?: string; b64_json?: string }) => {
+    if (img.b64_json) {
+      // 优先使用 Base64
+      return `![Generated Image](data:image/png;base64,${img.b64_json})`;
+    } else if (img.url) {
+      // 备用使用 URL
+      return `![Generated Image](${img.url})`;
+    }
+    return "";
+  }).filter(Boolean).join("\n\n") || "图片生成失败";
   
-  logApiCallEnd("VolcEngine", "generate_image", true, duration);
+  logApiCallEnd("VolcEngine", apiType, true, duration);
   return result;
 }
 
+/**
+ * Gitee（模力方舟）图片生成处理函数
+ *
+ * 【文生图】纯文字生成图片
+ *   - API：GiteeConfig.apiUrl (同步 API)
+ *   - 默认尺寸：GiteeConfig.defaultSize (2048x2048)
+ *   - 支持模型：Qwen-Image-Edit-2511
+ *   - 返回格式：Base64 嵌入（永久有效）
+ *
+ * 【图生图】参考图片 + 文字生成图片
+ *   - API：GiteeConfig.editApiUrl (同步图片编辑 API)
+ *   - 默认尺寸：GiteeConfig.defaultEditSize (1024x1024)
+ *   - 支持模型：Qwen-Image-Edit-2511
+ *   - 输入格式：multipart/form-data，图片自动转换为 Base64
+ *   - 返回格式：Base64 嵌入（永久有效）
+ *   - 注意：图片编辑模型对尺寸有限制，仅支持 1024x1024
+ */
 async function handleGitee(
   apiKey: string,
   reqBody: ChatRequest,
   prompt: string,
+  images: string[],
   requestId: string
 ): Promise<string> {
   const startTime = Date.now();
-  logApiCallStart("Gitee", "generate_image");
-
-  // 记录完整 Prompt
+  const hasImages = images.length > 0;
+  const apiType = hasImages ? "image_edit" : "generate_image";
+  
+  logApiCallStart("Gitee", apiType);
   logFullPrompt("Gitee", requestId, prompt);
   
-  // 使用配置中的默认模型，支持多模型
-  const model = reqBody.model && GiteeConfig.supportedModels.includes(reqBody.model)
-    ? reqBody.model
-    : GiteeConfig.defaultModel;
-  const size = reqBody.size || "2048x2048";
-  
-  // 记录生成开始
-  logImageGenerationStart("Gitee", requestId, model, size, prompt.length);
-
-  const giteeRequest = {
-    model: model,
-    prompt: prompt || "A beautiful scenery",
-    size: size,
-    n: 1,
-    response_format: "url"
-  };
-
-  debug("Gitee", `发送请求到: ${GiteeConfig.apiUrl}`);
-
-  const response = await fetchWithTimeout(GiteeConfig.apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-      "User-Agent": "ImgRouter/1.0"
-    },
-    body: JSON.stringify(giteeRequest),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    const err = new Error(`Gitee API Error (${response.status}): ${errorText}`);
-    error("Gitee", `API 错误: ${response.status}`);
-    logImageGenerationFailed("Gitee", requestId, errorText);
-    logApiCallEnd("Gitee", "generate_image", false, Date.now() - startTime);
-    throw err;
+  if (hasImages) {
+    logInputImages("Gitee", requestId, images);
   }
 
-  const responseText = await response.text();
-  const data = JSON.parse(responseText);
+  // 文生图和图生图使用不同的默认尺寸
+  const size = reqBody.size || (hasImages ? GiteeConfig.defaultEditSize : GiteeConfig.defaultSize);
 
-  if (!data.data || !Array.isArray(data.data) || data.data.length === 0) {
-    const err = new Error(`Gitee API 返回数据格式异常: ${JSON.stringify(data)}`);
-    error("Gitee", "返回数据格式异常");
-    logImageGenerationFailed("Gitee", requestId, "返回数据格式异常");
-    logApiCallEnd("Gitee", "generate_image", false, Date.now() - startTime);
-    throw err;
-  }
+  if (hasImages) {
+    // ========== 图片编辑模式（同步 API）==========
+    // 选择编辑模型
+    const model = reqBody.model && GiteeConfig.editModels.includes(reqBody.model)
+      ? reqBody.model
+      : GiteeConfig.editModels[0]; // 默认使用第一个编辑模型
+    
+    logImageGenerationStart("Gitee", requestId, model, size, prompt.length);
+    info("Gitee", `使用图片编辑模式, 模型: ${model}`);
 
-  // 记录生成的图片 URL
-  logGeneratedImages("Gitee", requestId, data.data);
-  
-  const duration = Date.now() - startTime;
-  const imageCount = data.data.length;
-  logImageGenerationComplete("Gitee", requestId, imageCount, duration);
-
-  const imageUrls = data.data.map((img: { url?: string; b64_json?: string }) => {
-    if (img.url) {
-      return `![Generated Image](${img.url})`;
-    } else if (img.b64_json) {
-      return `![Generated Image](data:image/png;base64,${img.b64_json})`;
+    // 处理图片输入：统一转换为 Base64 格式
+    const imageInput = images[0];
+    let base64Data: string;
+    let mimeType: string;
+    
+    if (imageInput.startsWith("data:image/")) {
+      // 已经是 Base64 格式，直接提取
+      base64Data = imageInput.split(",")[1];
+      mimeType = imageInput.split(";")[0].split(":")[1];
+      info("Gitee", "输入图片已是 Base64 格式");
+    } else {
+      // URL 格式：下载并转换为 Base64
+      info("Gitee", `正在下载图片并转换为 Base64: ${imageInput.substring(0, 50)}...`);
+      const downloaded = await urlToBase64(imageInput);
+      base64Data = downloaded.base64;
+      mimeType = downloaded.mimeType;
+      info("Gitee", `图片下载完成, MIME: ${mimeType}, 大小: ${Math.round(base64Data.length / 1024)}KB`);
     }
-    return "";
-  }).filter(Boolean);
 
-  const result = imageUrls.join("\n\n");
-  logApiCallEnd("Gitee", "generate_image", true, duration);
-  return result || "图片生成失败";
+    // 将 Base64 转换为 Blob
+    const binaryData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+    const blob = new Blob([binaryData], { type: mimeType });
+
+    // 构建 multipart/form-data 请求
+    const formData = new FormData();
+    formData.append("model", model);
+    formData.append("prompt", prompt || "");
+    formData.append("size", GiteeConfig.defaultEditSize); // 使用配置中的图生图尺寸
+    formData.append("n", "1");
+    formData.append("response_format", "b64_json"); // 使用 Base64 返回
+    formData.append("image", blob, "image.png");
+
+    debug("Gitee", `发送图片编辑请求到: ${GiteeConfig.editApiUrl}`);
+
+    const response = await fetchWithTimeout(GiteeConfig.editApiUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const err = new Error(`Gitee Edit API Error (${response.status}): ${errorText}`);
+      error("Gitee", `图片编辑 API 错误: ${response.status}`);
+      logImageGenerationFailed("Gitee", requestId, errorText);
+      logApiCallEnd("Gitee", apiType, false, Date.now() - startTime);
+      throw err;
+    }
+
+    // 同步 API 直接返回结果
+    const data = await response.json();
+    const imageData = data.data || [];
+    
+    if (!imageData || imageData.length === 0) {
+      throw new Error("Gitee 返回数据为空");
+    }
+
+    logGeneratedImages("Gitee", requestId, imageData);
+    
+    const duration = Date.now() - startTime;
+    logImageGenerationComplete("Gitee", requestId, imageData.length, duration);
+
+    // 构建返回结果（优先使用 Base64 嵌入）
+    const results = imageData.map((img: { url?: string; b64_json?: string }) => {
+      if (img.b64_json) {
+        return `![Generated Image](data:image/png;base64,${img.b64_json})`;
+      } else if (img.url) {
+        return `![Generated Image](${img.url})`;
+      }
+      return "";
+    }).filter(Boolean);
+
+    logApiCallEnd("Gitee", apiType, true, duration);
+    return results.join("\n\n") || "图片生成失败";
+    
+  } else {
+    // ========== 文生图模式（同步 API）==========
+    const model = reqBody.model && GiteeConfig.supportedModels.includes(reqBody.model)
+      ? reqBody.model
+      : GiteeConfig.defaultModel;
+    
+    logImageGenerationStart("Gitee", requestId, model, size, prompt.length);
+    info("Gitee", `使用文生图模式, 模型: ${model}`);
+
+    const giteeRequest = {
+      model: model,
+      prompt: prompt || "A beautiful scenery",
+      size: size,
+      n: 1,
+      response_format: "b64_json" // 使用 Base64 返回
+    };
+
+    debug("Gitee", `发送文生图请求到: ${GiteeConfig.apiUrl}`);
+
+    const response = await fetchWithTimeout(GiteeConfig.apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(giteeRequest),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const err = new Error(`Gitee API Error (${response.status}): ${errorText}`);
+      error("Gitee", `文生图 API 错误: ${response.status}`);
+      logImageGenerationFailed("Gitee", requestId, errorText);
+      logApiCallEnd("Gitee", apiType, false, Date.now() - startTime);
+      throw err;
+    }
+
+    // 同步 API 直接返回结果
+    const data = await response.json();
+    const imageData = data.data || [];
+    
+    if (!imageData || imageData.length === 0) {
+      throw new Error("Gitee 返回数据为空");
+    }
+
+    logGeneratedImages("Gitee", requestId, imageData);
+    
+    const duration = Date.now() - startTime;
+    logImageGenerationComplete("Gitee", requestId, imageData.length, duration);
+
+    // 构建返回结果（优先使用 Base64 嵌入）
+    const results = imageData.map((img: { url?: string; b64_json?: string }) => {
+      if (img.b64_json) {
+        return `![Generated Image](data:image/png;base64,${img.b64_json})`;
+      } else if (img.url) {
+        return `![Generated Image](${img.url})`;
+      }
+      return "";
+    }).filter(Boolean);
+
+    logApiCallEnd("Gitee", apiType, true, duration);
+    return results.join("\n\n") || "图片生成失败";
+  }
 }
 
+/**
+ * ModelScope（魔搭）图片生成处理函数
+ *
+ * 【文生图】纯文字生成图片
+ *   - API：异步任务模式（提交 + 轮询）
+ *   - 默认尺寸：ModelScopeConfig.defaultSize (2048x2048)
+ *   - 支持模型：Tongyi-MAI/Z-Image-Turbo
+ *   - 返回格式：图片 URL
+ *
+ * 【图生图】暂不支持
+ *   - ModelScope 当前配置的模型不支持图片编辑
+ *   - defaultEditSize 预留配置，待后续支持
+ */
 async function handleModelScope(
   apiKey: string,
   reqBody: ChatRequest,
@@ -323,7 +567,9 @@ async function handleModelScope(
   const model = reqBody.model && ModelScopeConfig.supportedModels.includes(reqBody.model)
     ? reqBody.model
     : ModelScopeConfig.defaultModel;
-  const size = reqBody.size || "2048x2048";
+  
+  // 文生图默认尺寸（ModelScope 暂不支持图生图）
+  const size = reqBody.size || ModelScopeConfig.defaultSize;
   
   // 记录生成开始
   logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
@@ -414,7 +660,18 @@ async function handleModelScope(
 
 /**
  * HuggingFace 图片生成处理函数
- * 支持多 URL 故障转移：当前 URL 失败时自动尝试下一个
+ *
+ * 【文生图】纯文字生成图片
+ *   - API：Gradio API（HF Spaces）
+ *   - 默认尺寸：HuggingFaceConfig.defaultSize (2048x2048)
+ *   - 支持模型：z-image-turbo, Qwen-Image-Edit-2511
+ *   - 返回格式：图片 URL
+ *   - 特性：支持多 URL 故障转移，自动切换备用节点
+ *
+ * 【图生图】暂不支持
+ *   - 当前 Gradio API 配置不支持图片输入
+ *   - 如果传入图片会被忽略并给出警告
+ *   - defaultEditSize 预留配置，待后续支持
  */
 async function handleHuggingFace(
   apiKey: string,
@@ -429,14 +686,18 @@ async function handleHuggingFace(
   // 记录完整 Prompt
   logFullPrompt("HuggingFace", requestId, prompt);
   
-  // 记录输入图片
-  logInputImages("HuggingFace", requestId, images);
+  // 记录输入图片（如果有，会被忽略）
+  if (images.length > 0) {
+    logInputImages("HuggingFace", requestId, images);
+  }
   
   // 使用配置中的默认模型
   const model = reqBody.model && HuggingFaceConfig.supportedModels.includes(reqBody.model)
     ? reqBody.model
     : HuggingFaceConfig.defaultModel;
-  const size = reqBody.size || "2048x2048";
+  
+  // 文生图默认尺寸（HuggingFace 暂不支持图生图）
+  const size = reqBody.size || HuggingFaceConfig.defaultSize;
   const [width, height] = size.split('x').map(Number);
   const seed = Math.round(Math.random() * 2147483647);
   const steps = 9;
@@ -645,7 +906,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         imageContent = await handleVolcEngine(apiKey, requestBody, prompt, images, requestId);
         break;
       case "Gitee":
-        imageContent = await handleGitee(apiKey, requestBody, prompt, requestId);
+        imageContent = await handleGitee(apiKey, requestBody, prompt, images, requestId);
         break;
       case "ModelScope":
         imageContent = await handleModelScope(apiKey, requestBody, prompt, requestId);
@@ -747,6 +1008,17 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
 // ================= 启动服务 =================
 
+// 读取版本号
+async function getVersion(): Promise<string> {
+  try {
+    const denoJson = await Deno.readTextFile("./deno.json");
+    const config = JSON.parse(denoJson);
+    return config.version || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 await initLogger();
 
 const logLevel = Deno.env.get("LOG_LEVEL")?.toUpperCase();
@@ -754,7 +1026,9 @@ if (logLevel && logLevel in LogLevel) {
   configureLogger({ level: LogLevel[logLevel as keyof typeof LogLevel] });
 }
 
+const version = await getVersion();
 info("Startup", `🚀 服务启动端口 ${PORT}`);
+info("Startup", `📦 版本: ${version}`);
 info("Startup", "🔧 支持: 火山引擎, Gitee, ModelScope, HuggingFace");
 info("Startup", `📁 日志目录: ./data/logs`);
 

@@ -1,15 +1,16 @@
 # ImgRouter
 
-> 四合一图像生成 API 中转服务 - 一个接口，多渠道图像生成
+> 智能图像生成网关 — 一个 OpenAI 兼容接口，通过chat自动路由多平台 AI 进行绘图服务
 
 [![Deno](https://img.shields.io/badge/Deno-2.x-000000?logo=deno)](https://deno.land/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lianwusuoai/img-router)
 
 ## 特性
 
 - **智能路由** - 根据 API Key 格式自动识别并分发到对应渠道
-- **四渠道支持** - 火山引擎、Gitee (模力方舟)、ModelScope (魔塔)、Hugging Face
+- **多渠道支持** - 火山引擎、Gitee (模力方舟)、ModelScope (魔搭)、Hugging Face
 - **OpenAI 兼容** - 完全兼容 `/v1/chat/completions` 接口格式
 - **流式响应** - 支持 SSE 流式输出
 - **图片参考** - 支持上传参考图片进行图生图
@@ -37,9 +38,18 @@
            ▼           ▼           ▼           ▼
      ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
      │VolcEngine│ │  Gitee   │ │ModelScope│ │HuggingFac│
-     │ (火山)   │ │(模力方舟)│ │  (魔塔)  │ │ (抱脸)   │
+     │ (火山)   │ │(模力方舟)│ │  (魔搭)  │ │ (抱抱脸)   │
+     │ 官方URL  │ │URL/Base64│ │ 官方URL  │ │ 临时URL  │
      └──────────┘ └──────────┘ └──────────┘ └──────────┘
 ```
+
+**图片返回方式说明：**
+- **火山引擎** - 返回官方 CDN 直链 URL，稳定可靠
+- **Gitee** - 优先返回官方 URL，也支持 Base64 格式
+- **ModelScope** - 返回魔搭 OSS 直链 URL
+- **Hugging Face** - 返回 HF Spaces 临时 URL（有效期有限，建议及时保存）
+
+> ⚠️ **网络问题提示**：火山引擎返回的图片 URL 来自阿里云 OSS（`muse-ai.oss-cn-hangzhou.aliyuncs.com`），该域名只接受国内直连访问。如果你使用代理/VPN，需要将对应规则加入直连列表，否则图片可能无法正常显示。HF也是同理。
 
 ## 快速开始
 
