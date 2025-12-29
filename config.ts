@@ -1,3 +1,18 @@
+// ================= 图床配置 =================
+// CloudFlare ImgBed 图床 - 用于将 Base64 图片转换为 URL
+export const ImageBedConfig = {
+  // 图床地址
+  baseUrl: "https://imgbed.lianwusuoai.top",
+  // 上传端点
+  uploadEndpoint: "/upload",
+  // 上传认证码
+  authCode: "imgbed_xKAGfobLGhsEBEMlt5z0yvYdtw8zNTM6",
+  // 上传目录
+  uploadFolder: "img-router",
+  // 上传渠道（telegram、cfr2、s3）
+  uploadChannel: "s3",
+};
+
 // ================= 渠道配置 =================
 // 支持：火山引擎 (VolcEngine/豆包)、Gitee (模力方舟)、ModelScope (魔搭)、Hugging Face
 
@@ -63,14 +78,28 @@ export const GiteeConfig: GiteeProviderConfig = {
   ],
 };
 
-// ModelScope（魔搭）配置
-export const ModelScopeConfig: ProviderConfig = {
+// ModelScope（魔搭）配置 - 支持文生图和图生图
+export interface ModelScopeProviderConfig {
+  apiUrl: string;
+  defaultModel: string;           // 文生图默认模型
+  defaultEditModel: string;       // 图生图默认模型
+  defaultSize: string;            // 文生图默认尺寸
+  defaultEditSize: string;        // 图生图默认尺寸
+  supportedModels: string[];      // 文生图支持的模型
+  editModels: string[];           // 图生图支持的模型
+}
+
+export const ModelScopeConfig: ModelScopeProviderConfig = {
   apiUrl: "https://api-inference.modelscope.cn/v1",
-  defaultModel: "Tongyi-MAI/Z-Image-Turbo",
-  defaultSize: "2048x2048",      // 文生图默认尺寸
-  defaultEditSize: "2048x2048",  // 图生图默认尺寸（暂不支持）
+  defaultModel: "Tongyi-MAI/Z-Image-Turbo",           // 文生图模型
+  defaultEditModel: "Qwen/Qwen-Image-Edit-2511",      // 图生图/融合生图模型
+  defaultSize: "1024x1024",       // 文生图默认尺寸
+  defaultEditSize: "1328x1328",   // 图生图默认尺寸
   supportedModels: [
     "Tongyi-MAI/Z-Image-Turbo",
+  ],
+  editModels: [
+    "Qwen/Qwen-Image-Edit-2511",  // 通义千问图片编辑模型
   ],
 };
 

@@ -35,6 +35,7 @@ import {
   GiteeConfig,
   ModelScopeConfig,
   HuggingFaceConfig,
+  ImageBedConfig,
   API_TIMEOUT_MS,
   PORT,
 } from "./config.ts";
@@ -201,6 +202,43 @@ async function fetchWithTimeout(
 // ================= 辅助函数 =================
 
 /**
+ * 根据图片二进制数据的魔数（Magic Number）检测真实 MIME 类型
+ * @param uint8Array 图片二进制数据
+ * @returns 检测到的 MIME 类型，如果无法识别则返回 null
+ */
+function detectImageMimeType(uint8Array: Uint8Array): string | null {
+  if (uint8Array.length < 4) return null;
+  
+  // PNG: 89 50 4E 47
+  if (uint8Array[0] === 0x89 && uint8Array[1] === 0x50 && uint8Array[2] === 0x4E && uint8Array[3] === 0x47) {
+    return "image/png";
+  }
+  
+  // JPEG: FF D8 FF
+  if (uint8Array[0] === 0xFF && uint8Array[1] === 0xD8 && uint8Array[2] === 0xFF) {
+    return "image/jpeg";
+  }
+  
+  // GIF: 47 49 46 38
+  if (uint8Array[0] === 0x47 && uint8Array[1] === 0x49 && uint8Array[2] === 0x46 && uint8Array[3] === 0x38) {
+    return "image/gif";
+  }
+  
+  // WebP: 52 49 46 46 ... 57 45 42 50
+  if (uint8Array[0] === 0x52 && uint8Array[1] === 0x49 && uint8Array[2] === 0x46 && uint8Array[3] === 0x46 &&
+      uint8Array.length > 11 && uint8Array[8] === 0x57 && uint8Array[9] === 0x45 && uint8Array[10] === 0x42 && uint8Array[11] === 0x50) {
+    return "image/webp";
+  }
+  
+  // BMP: 42 4D
+  if (uint8Array[0] === 0x42 && uint8Array[1] === 0x4D) {
+    return "image/bmp";
+  }
+  
+  return null;
+}
+
+/**
  * 将图片 URL 下载并转换为 Base64 格式
  * @param url 图片 URL
  * @returns Base64 编码的图片数据（不含 data:image/xxx;base64, 前缀）
@@ -220,11 +258,111 @@ async function urlToBase64(url: string): Promise<{ base64: string; mimeType: str
   }
   const base64 = btoa(binary);
   
-  // 获取 MIME 类型
-  const contentType = response.headers.get("content-type") || "image/png";
-  const mimeType = contentType.split(";")[0].trim();
+  // 优先通过魔数检测真实 MIME 类型（解决 OSS 返回 application/octet-stream 的问题）
+  let mimeType = detectImageMimeType(uint8Array);
+  
+  // 如果魔数检测失败，尝试使用服务器返回的 Content-Type
+  if (!mimeType) {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.startsWith("image/")) {
+      mimeType = contentType.split(";")[0].trim();
+    }
+  }
+  
+  // 如果仍然无法确定，根据 URL 扩展名推断
+  if (!mimeType) {
+    const urlLower = url.toLowerCase();
+    if (urlLower.endsWith(".png")) mimeType = "image/png";
+    else if (urlLower.endsWith(".jpg") || urlLower.endsWith(".jpeg")) mimeType = "image/jpeg";
+    else if (urlLower.endsWith(".gif")) mimeType = "image/gif";
+    else if (urlLower.endsWith(".webp")) mimeType = "image/webp";
+    else if (urlLower.endsWith(".bmp")) mimeType = "image/bmp";
+    else mimeType = "image/png"; // 最终默认使用 PNG
+  }
   
   return { base64, mimeType };
+}
+
+/**
+ * 将 Base64 图片上传到图床，获取 URL
+ * 用于魔搭等只接受 URL 格式图片的 API
+ * @param base64Data Base64 编码的图片数据（可以带或不带 data:image/xxx;base64, 前缀）
+ * @returns 图片的 URL
+ */
+async function base64ToUrl(base64Data: string): Promise<string> {
+  // 解析 Base64 数据
+  let base64Content: string;
+  let mimeType: string;
+  
+  if (base64Data.startsWith("data:image/")) {
+    // 带前缀格式: data:image/png;base64,xxxxx
+    const parts = base64Data.split(",");
+    base64Content = parts[1];
+    mimeType = parts[0].split(";")[0].split(":")[1];
+  } else {
+    // 纯 Base64 数据
+    base64Content = base64Data;
+    mimeType = "image/png"; // 默认 PNG
+  }
+  
+  // 将 Base64 转换为二进制数据
+  const binaryData = Uint8Array.from(atob(base64Content), c => c.charCodeAt(0));
+  const blob = new Blob([binaryData], { type: mimeType });
+  
+  // 根据 MIME 类型确定文件扩展名
+  const extMap: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+  };
+  const ext = extMap[mimeType] || "png";
+  const filename = `img_${Date.now()}.${ext}`;
+  
+  // 构建 multipart/form-data 请求
+  const formData = new FormData();
+  formData.append("file", blob, filename);
+  
+  // 构建上传 URL（带参数）
+  const uploadUrl = new URL(ImageBedConfig.uploadEndpoint, ImageBedConfig.baseUrl);
+  uploadUrl.searchParams.set("uploadChannel", ImageBedConfig.uploadChannel);
+  uploadUrl.searchParams.set("uploadFolder", ImageBedConfig.uploadFolder);
+  uploadUrl.searchParams.set("returnFormat", "full"); // 返回完整链接格式
+  
+  info("ImageBed", `正在上传图片到图床: ${filename} (${Math.round(binaryData.length / 1024)}KB)`);
+  
+  // 使用 Authorization Header 传递 API Token
+  const response = await fetchWithTimeout(uploadUrl.toString(), {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${ImageBedConfig.authCode}`,
+    },
+    body: formData,
+  }, 60000); // 图床上传超时 60 秒
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`图床上传失败 (${response.status}): ${errorText}`);
+  }
+  
+  const result = await response.json();
+  
+  // 解析返回结果，获取图片 URL
+  // 返回格式: [{ "src": "/file/xxx.jpg" }] 或 [{ "src": "https://xxx/file/xxx.jpg" }]
+  if (!result || !Array.isArray(result) || result.length === 0 || !result[0].src) {
+    throw new Error(`图床返回格式异常: ${JSON.stringify(result)}`);
+  }
+  
+  let imageUrl = result[0].src;
+  
+  // 如果返回的是相对路径，拼接完整 URL
+  if (!imageUrl.startsWith("http")) {
+    imageUrl = `${ImageBedConfig.baseUrl}${imageUrl}`;
+  }
+  
+  info("ImageBed", `✅ 图片上传成功: ${imageUrl}`);
+  return imageUrl;
 }
 
 // ================= 渠道处理函数 =================
@@ -541,38 +679,125 @@ async function handleGitee(
 /**
  * ModelScope（魔搭）图片生成处理函数
  *
- * 【文生图】纯文字生成图片
+ * 【文生图】纯文字生成图片（无图片输入）
  *   - API：异步任务模式（提交 + 轮询）
- *   - 默认尺寸：ModelScopeConfig.defaultSize (2048x2048)
- *   - 支持模型：Tongyi-MAI/Z-Image-Turbo
- *   - 返回格式：图片 URL
+ *   - 默认尺寸：ModelScopeConfig.defaultSize (1024x1024)
+ *   - 模型：Tongyi-MAI/Z-Image-Turbo
+ *   - 返回格式：优先 Base64 嵌入，URL 作为备用
  *
- * 【图生图】暂不支持
- *   - ModelScope 当前配置的模型不支持图片编辑
- *   - defaultEditSize 预留配置，待后续支持
+ * 【图生图】参考图片 + 文字生成图片
+ *   - API：异步任务模式（提交 + 轮询）
+ *   - 默认尺寸：ModelScopeConfig.defaultEditSize (1328x1328)
+ *   - 模型：Qwen/Qwen-Image-Edit-2511
+ *   - 支持单图或多图输入
+ *   - 返回格式：优先 Base64 嵌入，URL 作为备用
+ *
+ * 【融合生图】上下文图片 + 本次图片/文字
+ *   - 自动从上下文提取历史图片
+ *   - 与本次图片合并进行融合生成
+ *   - 模型：Qwen/Qwen-Image-Edit-2511
  */
 async function handleModelScope(
   apiKey: string,
   reqBody: ChatRequest,
   prompt: string,
+  images: string[],
   requestId: string
 ): Promise<string> {
   const startTime = Date.now();
-  logApiCallStart("ModelScope", "generate_image");
+  const hasImages = images.length > 0;
+  const apiType = hasImages ? "image_edit" : "generate_image";
+  
+  logApiCallStart("ModelScope", apiType);
 
   // 记录完整 Prompt
   logFullPrompt("ModelScope", requestId, prompt);
   
-  // 使用配置中的默认模型，支持多模型
-  const model = reqBody.model && ModelScopeConfig.supportedModels.includes(reqBody.model)
-    ? reqBody.model
-    : ModelScopeConfig.defaultModel;
+  // 记录输入图片（如果有）
+  if (hasImages) {
+    logInputImages("ModelScope", requestId, images);
+  }
   
-  // 文生图默认尺寸（ModelScope 暂不支持图生图）
-  const size = reqBody.size || ModelScopeConfig.defaultSize;
+  // 智能选择模型：有图片用图生图模型，无图片用文生图模型
+  let model: string;
+  let size: string;
+  
+  if (hasImages) {
+    // 图生图/融合生图模式
+    model = reqBody.model && ModelScopeConfig.editModels.includes(reqBody.model)
+      ? reqBody.model
+      : ModelScopeConfig.defaultEditModel;
+    size = reqBody.size || ModelScopeConfig.defaultEditSize;
+    info("ModelScope", `使用图生图模式, 模型: ${model}, 图片数量: ${images.length}`);
+  } else {
+    // 文生图模式
+    model = reqBody.model && ModelScopeConfig.supportedModels.includes(reqBody.model)
+      ? reqBody.model
+      : ModelScopeConfig.defaultModel;
+    size = reqBody.size || ModelScopeConfig.defaultSize;
+    info("ModelScope", `使用文生图模式, 模型: ${model}`);
+  }
   
   // 记录生成开始
   logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
+
+  // 构建请求体
+  interface ModelScopeRequest {
+    model: string;
+    prompt: string;
+    size?: string;
+    n?: number;
+    image_url?: string[];
+  }
+  
+  const requestBody: ModelScopeRequest = {
+    model: model,
+    prompt: prompt || "A beautiful scenery",
+  };
+  
+  // 文生图模式添加尺寸和数量参数
+  if (!hasImages) {
+    requestBody.size = size;
+    requestBody.n = 1;
+  }
+  
+  // 图生图模式添加图片 URL 参数
+  if (hasImages) {
+    // 魔搭 API 只接受 URL 格式的图片
+    // 将所有图片转换为 URL 格式（Base64 上传到图床获取 URL）
+    const urlImages: string[] = [];
+    
+    for (const img of images) {
+      if (img.startsWith("http")) {
+        // 已经是 URL 格式，直接使用
+        urlImages.push(img);
+        info("ModelScope", `使用 URL 格式图片: ${img.substring(0, 60)}...`);
+      } else if (img.startsWith("data:image/")) {
+        // Base64 格式，上传到图床获取 URL
+        info("ModelScope", `检测到 Base64 图片，正在上传到图床...`);
+        try {
+          const imageUrl = await base64ToUrl(img);
+          urlImages.push(imageUrl);
+          info("ModelScope", `✅ Base64 图片已转换为 URL: ${imageUrl}`);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          warn("ModelScope", `❌ Base64 图片上传失败: ${msg}`);
+          // 继续处理其他图片，不中断
+        }
+      }
+    }
+    
+    if (urlImages.length > 0) {
+      requestBody.image_url = urlImages;
+      info("ModelScope", `发送 ${urlImages.length} 张 URL 格式图片给魔搭 API`);
+    } else {
+      // 没有可用的 URL 格式图片，回退到文生图模式
+      warn("ModelScope", "无可用 URL 格式图片，回退到文生图模式");
+      requestBody.model = ModelScopeConfig.defaultModel;
+      requestBody.size = ModelScopeConfig.defaultSize;
+      requestBody.n = 1;
+    }
+  }
 
   const submitResponse = await fetchWithTimeout(`${ModelScopeConfig.apiUrl}/images/generations`, {
     method: "POST",
@@ -581,19 +806,14 @@ async function handleModelScope(
       "Authorization": `Bearer ${apiKey}`,
       "X-ModelScope-Async-Mode": "true"
     },
-    body: JSON.stringify({
-      model: model,
-      prompt: prompt || "A beautiful scenery",
-      size: size,
-      n: 1
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
     const err = new Error(`ModelScope Submit Error (${submitResponse.status}): ${errorText}`);
     logImageGenerationFailed("ModelScope", requestId, errorText);
-    logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+    logApiCallEnd("ModelScope", apiType, false, Date.now() - startTime);
     throw err;
   }
 
@@ -625,26 +845,45 @@ async function handleModelScope(
     const status = checkData.task_status;
 
     if (status === "SUCCEED") {
-      const imageUrls = checkData.output_images || [];
+      const outputImageUrls = checkData.output_images || [];
       
       // 记录生成的图片 URL
-      const imageData = imageUrls.map((url: string) => ({ url }));
+      const imageData = outputImageUrls.map((url: string) => ({ url }));
       logGeneratedImages("ModelScope", requestId, imageData);
       
       const duration = Date.now() - startTime;
-      const imageCount = imageUrls.length;
+      const imageCount = outputImageUrls.length;
       logImageGenerationComplete("ModelScope", requestId, imageCount, duration);
       
-      const result = imageUrls.map((url: string) => `![Generated Image](${url})`).join("\n\n") || "图片生成失败";
+      // 将输出图片转换为 Base64 格式以实现永久保存
+      const results: string[] = [];
+      for (const url of outputImageUrls) {
+        // 在日志中记录原始 URL（用于调试和追溯）
+        info("ModelScope", `📎 原始图片 URL: ${url}`);
+        info("ModelScope", `正在下载图片并转换为 Base64...`);
+        try {
+          const { base64, mimeType } = await urlToBase64(url);
+          const sizeKB = Math.round(base64.length / 1024);
+          info("ModelScope", `✅ 图片已转换为 Base64, MIME: ${mimeType}, 大小: ${sizeKB}KB`);
+          // 返回 Base64 格式用于显示（永久有效）
+          results.push(`![Generated Image](data:${mimeType};base64,${base64})`);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          warn("ModelScope", `❌ 图片转换 Base64 失败，使用 URL: ${msg}`);
+          results.push(`![Generated Image](${url})`);
+        }
+      }
+      
+      const result = results.join("\n\n") || "图片生成失败";
       
       info("ModelScope", `任务成功完成, 耗时: ${pollingAttempts}次轮询`);
-      logApiCallEnd("ModelScope", "generate_image", true, duration);
+      logApiCallEnd("ModelScope", apiType, true, duration);
       return result;
     } else if (status === "FAILED") {
       const err = new Error(`ModelScope Task Failed: ${JSON.stringify(checkData)}`);
       error("ModelScope", "任务失败");
       logImageGenerationFailed("ModelScope", requestId, JSON.stringify(checkData));
-      logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+      logApiCallEnd("ModelScope", apiType, false, Date.now() - startTime);
       throw err;
     } else {
       debug("ModelScope", `状态: ${status} (第${i + 1}次)`);
@@ -654,7 +893,7 @@ async function handleModelScope(
   const err = new Error("ModelScope Task Timeout");
   error("ModelScope", "任务超时");
   logImageGenerationFailed("ModelScope", requestId, "任务超时");
-  logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+  logApiCallEnd("ModelScope", apiType, false, Date.now() - startTime);
   throw err;
 }
 
@@ -909,7 +1148,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         imageContent = await handleGitee(apiKey, requestBody, prompt, images, requestId);
         break;
       case "ModelScope":
-        imageContent = await handleModelScope(apiKey, requestBody, prompt, requestId);
+        imageContent = await handleModelScope(apiKey, requestBody, prompt, images, requestId);
         break;
       case "HuggingFace":
         imageContent = await handleHuggingFace(apiKey, requestBody, prompt, images, requestId);
