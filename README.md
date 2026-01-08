@@ -14,38 +14,41 @@
 - **OpenAI 完全兼容** - 支持 `/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits` 接口
 - **流式响应** - 支持 SSE 流式输出
 - **文生图 & 图生图** - 支持纯文字生成图片，也支持上传参考图片进行图片编辑
-- **智能图片处理** - 自动标准化图片格式，支持非标准格式转换
+- **智能图片处理** - 自动标准化图片格式，支持非标准格式转换（如 Cherry Studio）
+- **WebP 自动转换** - WebP 格式图片自动转换为 PNG，确保兼容性
 - **Base64 永久保存** - 所有生成的图片自动转换为 Base64 返回，永久有效
 - **故障转移** - HuggingFace 渠道支持多 URL 资源池自动切换
+- **安全防护** - 内置 SSRF 防护，URL 安全校验
+- **友好错误提示** - 智能识别错误类型，提供清晰的中文错误信息
 - **Docker 部署** - 开箱即用的容器化部署方案
-- **详细日志** - 完整的请求/响应日志记录
+- **详细日志** - 完整的请求/响应日志记录（北京时间 UTC+8）
 
 ## 架构
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      客户端请求                              │
-│              POST /v1/chat/completions                      │
-└─────────────────────┬───────────────────────────────────────┘
+│                       客户端请求                             │
+│               POST /v1/chat/completions                     │
+└──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   API Key 检测器                             │
-│  ┌─────────────┬─────────────────┬─────────────────────┐    │
-│  │ hf_*        │ ms-*            │ UUID 格式            │    │
-│  │ → HuggingFace│ → ModelScope   │ → VolcEngine        │    │
-│  │             │                 │                     │    │
-│  │ pk_* / sk_* │ 30-60位字母数字  │                     │    │
-│  │ → Pollinations│ → Gitee       │                     │    │
-│  └─────────────┴─────────────────┴─────────────────────┘    │
-└─────────────────────┬───────────────────────────────────────┘
+│                    API Key 检测器                            │
+│                                                             │
+│  • hf_* 开头           → HuggingFace (抱抱脸)                │
+│  • ms-* 开头           → ModelScope (魔搭)                   │
+│  • pk_* / sk_* 开头    → Pollinations                        │
+│  • UUID 格式           → VolcEngine (火山引擎/豆包)           │
+│  • 30-60位字母数字     → Gitee (模力方舟)                     │
+│                                                             │
+└──────────────────────┬──────────────────────────────────────┘
                        │
            ┌───────────┼───────────┬───────────┬───────────┐
            ▼           ▼           ▼           ▼           ▼
-     ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-     │VolcEngine│ │  Gitee   │ │ModelScope│ │HuggingFace│ │Pollinations│
-     │ (火山)   │ │(模力方舟)│ │  (魔搭)  │ │ (抱抱脸) │ │          │
-     └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘
+     ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
+     │VolcEngine│ │  Gitee   │ │ModelScope│ │HuggingFace│ │Pollinations │
+     │ (火山)   │ │(模力方舟) │ │  (魔搭)  │ │ (抱抱脸)  │ │              │
+     └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘
            │           │           │           │           │
            └───────────┴───────────┴───────────┴───────────┘
                        │
@@ -56,6 +59,8 @@
               │  (永久有效)     │
               └─────────────────┘
 ```
+
+
 
 ### 各渠道数据流详解
 
@@ -78,6 +83,7 @@
 **图片返回方式：**
 - 所有渠道生成的图片都会自动转换为 **Base64 格式**返回
 - Base64 嵌入在 Markdown 图片语法中，永久有效，无需担心链接过期
+- WebP 格式自动转换为 PNG，确保最大兼容性
 
 ## API 端点
 
@@ -206,9 +212,9 @@ export const GiteeConfig = {
 };
 ```
 
-### 修改默认分辨率    可以调小到64*64 但是不可以再大了，尺寸小生图快
+### 修改默认分辨率
 
-修改 `defaultSize` 和 `defaultEditSize` 字段：
+可以调小到 64x64，但不建议超过默认值，尺寸小生图快：
 
 ```typescript
 // 火山引擎
@@ -262,7 +268,7 @@ Pollinations 支持多种特有参数，可以在 `config.ts` 中配置：
 export const PollinationsConfig = {
   // 基础配置
   defaultModel: "flux",              // 文生图默认模型
-  defaultEditModel: "gptimage",      // 图生图默认模型
+  defaultEditModel: "nanobanana-pro",      // 图生图默认模型
   defaultSize: "1024x1024",          // 文生图默认尺寸
   defaultEditSize: "1024x1024",      // 图生图默认尺寸
 
@@ -309,13 +315,13 @@ export const API_TIMEOUT_MS = 300000;
 
 ## API Key 格式
 
-| 渠道 | 格式 | 示例 |
-|------|------|------|
-| 火山引擎 | UUID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| Gitee | 30-60位字母数字 | `abc123def456...` |
-| ModelScope | `ms-` 开头 | `ms-xxxxxxxxxx` |
-| Hugging Face | `hf_` 开头 | `hf_xxxxxxxxxx` |
-| Pollinations | `pk_` 或 `sk_` 开头 | `pk_3Ff4YHCp8TkauKXq` 或 `sk_zzqmqZp3Jex...` |
+| 渠道 | 格式 | 示例 | 获取地址 |
+|------|------|------|----------|
+| 火山引擎 | UUID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | [获取密钥](https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement/rewardPlan) |
+| Gitee | 30-60位字母数字 | `abc123def456...` | [获取密钥](https://ai.gitee.com/ondobtug/dashboard/settings/tokens) |
+| ModelScope | `ms-` 开头 | `ms-xxxxxxxxxx` | [获取密钥](https://www.modelscope.cn/my/myaccesstoken) |
+| Hugging Face | `hf_` 开头 | `hf_xxxxxxxxxx` | [获取密钥](https://huggingface.co/settings/tokens) |
+| Pollinations | `pk_` 或 `sk_` 开头 | `pk_3Ff4YHCp8TkauKXq` 或 `sk_zzqmqZp3Jex...` | [获取密钥](https://enter.pollinations.ai/) |
 
 系统根据 API Key 格式自动识别渠道，无需手动指定。
 
@@ -381,10 +387,10 @@ export const API_TIMEOUT_MS = 300000;
 | `zimage` | 文生图 | Z-Image Turbo + 2x放大 |
 | `kontext` | 文生图/图生图 | FLUX.1 Kontext 编辑 |
 | `nanobanana` | 文生图/图生图 | Gemini 2.5 Flash Image |
-| `nanobanana-pro` | 文生图/图生图 | Gemini 3 Pro Image (4K) |
+| `nanobanana-pro` | 文生图/图生图 | Gemini 3 Pro Image (4K)（图生图默认） |
 | `seedream` | 文生图/图生图 | ByteDance Seedream 4.0 |
 | `seedream-pro` | 文生图/图生图 | ByteDance Seedream 4.5 (4K) |
-| `gptimage` | 文生图/图生图 | GPT Image Mini（图生图默认） |
+| `gptimage` | 文生图/图生图 | GPT Image Mini |
 | `gptimage-large` | 文生图/图生图 | GPT Image 1.5 高级版 |
 
 > **Pollinations 密钥说明：**
@@ -401,6 +407,31 @@ export const API_TIMEOUT_MS = 300000;
 |------|------|--------|
 | `PORT` | 监听端口 | `10001` |
 | `LOG_LEVEL` | 日志级别 (DEBUG/INFO/WARN/ERROR) | `INFO` |
+
+### 日志系统
+
+- **时区**：所有日志使用北京时间（UTC+8）
+- **日志目录**：`./data/logs/`
+- **日志文件**：按日期自动分割（格式：`YYYY-MM-DD.log`）
+- **日志级别**：支持 DEBUG、INFO、WARN、ERROR
+- **日志内容**：包含请求ID、时间戳、模块名、详细信息
+
+### 错误处理
+
+系统内置智能错误识别，自动将技术错误转换为友好的中文提示：
+
+- **内容审核失败**：提示修改提示词
+- **参数错误**：提示检查输入格式
+- **服务器错误**：提示稍后重试或更换模型
+- **超时错误**：提示网络问题
+- **API Key 不可用**：提示检查配置
+
+### 安全特性
+
+- **SSRF 防护**：禁止访问内网地址和本地文件
+- **URL 白名单**：仅允许访问配置的图床域名和官方 API
+- **输入验证**：自动校验图片格式和大小
+- **错误隔离**：错误信息不泄露系统路径和敏感信息
 
 ## 许可证
 

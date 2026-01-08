@@ -189,30 +189,35 @@ export interface PollinationsProviderConfig {
 export const PollinationsConfig: PollinationsProviderConfig = {
   apiUrl: "https://gen.pollinations.ai",
   imageEndpoint: "/image",
-  defaultModel: "flux",
-  defaultEditModel: "gptimage",
+  defaultModel: "flux",              // 文生图默认：Flux Schnell
+  defaultEditModel: "nanobanana-pro",      // 图生图默认：nanobanana-pro
   defaultSize: "1024x1024",          // 文生图默认尺寸
   defaultEditSize: "1024x1024",      // 图生图默认尺寸
+  // 文生图支持的模型（包括纯文生图和支持图生图的模型）
   supportedModels: [
-    "flux",           // Flux Schnell - 快速高质量
-    "turbo",          // SDXL Turbo - 单步实时
-    "zimage",         // Z-Image Turbo
+    "flux",           // Flux Schnell - 快速高质量（仅文生图）
+    "turbo",          // SDXL Turbo - 单步实时（仅文生图）
+    "zimage",         // Z-Image Turbo - 6B Flux 2x放大（仅文生图）
     "kontext",        // FLUX.1 Kontext - 支持图生图
-    "nanobanana",     // Gemini 2.5 Flash Image
+    "nanobanana",     // Gemini 2.5 Flash Image - 支持图生图
+    "nanobanana-pro", // Gemini 3 Pro Image (4K) - 支持图生图
+    "seedream",       // Seedream 4.0 - 支持图生图
+    "seedream-pro",   // Seedream 4.5 Pro (4K) - 支持图生图
+    "gptimage",       // GPT Image Mini - 支持图生图
+    "gptimage-large", // GPT Image 1.5 - 支持图生图
+    "veo",            // Veo 3.1 Fast - 视频生成（支持图片输入）
+    "seedance",       // Seedance Lite - 视频生成（支持图片输入）
+    "seedance-pro",   // Seedance Pro-Fast - 视频生成（支持图片输入）
+  ],
+  // 图生图支持的模型（仅包含 input_modalities 包含 "image" 的模型）
+  editModels: [
     "nanobanana-pro", // Gemini 3 Pro Image (4K)
+    "gptimage",       // 敏感肌高审核 GPT Image Mini - 图生图首选
+    "gptimage-large", // 敏感肌高审核 GPT Image 1.5 - 高级版
+    "nanobanana",     // 敏感肌高审核 Gemini 2.5 Flash Image
     "seedream",       // Seedream 4.0
     "seedream-pro",   // Seedream 4.5 Pro (4K)
-    "gptimage",       // GPT Image Mini
-    "gptimage-large", // GPT Image 1.5
-  ],
-  editModels: [
-    "gptimage",       // GPT Image Mini - 图生图首选
-    "gptimage-large", // GPT Image 1.5
-    "kontext",        // FLUX.1 Kontext
-    "nanobanana",     // Gemini 2.5 Flash Image
-    "nanobanana-pro", // Gemini 3 Pro Image
-    "seedream",       // Seedream 支持图片输入
-    "seedream-pro",
+    // 注意：veo、seedance 系列输出视频，不包含在图生图列表中
   ],
   // Pollinations 特有参数默认值
   seed: -1,                          // -1 表示每次随机

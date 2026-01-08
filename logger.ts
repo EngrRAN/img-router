@@ -32,16 +32,17 @@ let config = {
 let logFile: Deno.FsFile | null = null;
 
 function writeLog(level: number, module: string, message: string): void {
-  // 控制台输出
+  const timestamp = getBeijingTimestamp();
+  const levelName = ["DEBUG", "INFO", "WARN", "ERROR"][level] || "INFO";
+  
+  // 控制台输出（带时间戳）
   if (level >= config.level) {
-    const prefix = level >= LogLevel.WARN ? "[WARN] " : "";
-    console.log(`${prefix}[${module}] ${message}`);
+    console.log(`[${timestamp}] [${levelName}] [${module}] ${message}`);
   }
 
+  // 文件输出
   if (config.fileEnabled && logFile) {
     try {
-      const timestamp = getBeijingTimestamp();
-      const levelName = ["DEBUG", "INFO", "WARN", "ERROR"][level] || "INFO";
       const line = `[${timestamp}] [${levelName}] [${module}] ${message}\n`;
       logFile.writeSync(new TextEncoder().encode(line));
     } catch { /* 忽略写入错误 */ }
@@ -138,20 +139,20 @@ export function logApiCallEnd(provider: string, op: string, success: boolean, du
 
 /** 记录完整 Prompt */
 export function logFullPrompt(provider: string, requestId: string, prompt: string): void {
-  writeLog(LogLevel.INFO, provider, `\n🤖 完整 Prompt (${requestId}):\n${"=".repeat(60)}\n${prompt}\n${"=".repeat(60)}`);
+  writeLog(LogLevel.INFO, provider, `🤖 完整 Prompt (${requestId}):\n${"=".repeat(60)}\n${prompt}\n${"=".repeat(60)}`);
 }
 
 /** 记录输入图片 */
 export function logInputImages(provider: string, requestId: string, images: string[]): void {
   if (images.length > 0) {
     const imageList = images.map((url, i) => `  ${i + 1}. ${url}`).join("\n");
-    writeLog(LogLevel.INFO, provider, `\n📷 输入图片 (${requestId}):\n${imageList}`);
+    writeLog(LogLevel.INFO, provider, `📷 输入图片 (${requestId}):\n${imageList}`);
   }
 }
 
 /** 记录图片生成开始 */
 export function logImageGenerationStart(provider: string, requestId: string, model: string, size: string, promptLength: number): void {
-  writeLog(LogLevel.INFO, provider, `\n🎨 开始生成图片 (${requestId}):\n  模型: ${model}\n  尺寸: ${size}\n  Prompt长度: ${promptLength} 字符`);
+  writeLog(LogLevel.INFO, provider, `🎨 开始生成图片 (${requestId}):\n  模型: ${model}\n  尺寸: ${size}\n  Prompt长度: ${promptLength} 字符`);
 }
 
 /** 记录生成的图片 */
@@ -159,9 +160,9 @@ export function logGeneratedImages(provider: string, requestId: string, images: 
   if (images.length > 0) {
     const imageUrls = images.map((img, i) => {
       if (img.url) {
-        return `\n🖼️ 图片 ${i + 1} (${requestId}):\n  URL: ${img.url}`;
+        return `🖼️ 图片 ${i + 1} (${requestId}):\n  URL: ${img.url}`;
       } else if (img.b64_json) {
-        return `\n🖼️ 图片 ${i + 1} (${requestId}):\n  Base64 (长度: ${img.b64_json.length})`;
+        return `🖼️ 图片 ${i + 1} (${requestId}):\n  Base64 (长度: ${img.b64_json.length})`;
       }
       return "";
     }).filter(Boolean).join("\n");

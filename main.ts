@@ -14,6 +14,7 @@ import {
   VolcEngineConfig, GiteeConfig, ModelScopeConfig, HuggingFaceConfig,
   PollinationsConfig, ImageBedConfig, API_TIMEOUT_MS, PORT,
 } from "./config.ts";
+import { parseErrorMessage } from "./error-handler.ts";
 
 type Provider = "VolcEngine" | "Gitee" | "ModelScope" | "HuggingFace" | "Pollinations" | "Unknown";
 
@@ -440,10 +441,10 @@ async function handleVolcEngine(
 
   if (!response.ok) {
     const errorText = await response.text();
-    const err = new Error(`VolcEngine API Error (${response.status}): ${errorText}`);
-    logImageGenerationFailed("VolcEngine", requestId, errorText);
+    const friendlyError = parseErrorMessage(errorText, response.status, "VolcEngine");
+    logImageGenerationFailed("VolcEngine", requestId, friendlyError);
     logApiCallEnd("VolcEngine", "generate_image", false, Date.now() - startTime);
-    throw err;
+    throw new Error(friendlyError);
   }
 
   const data = await response.json();
@@ -567,10 +568,11 @@ async function handleGitee(
 
       if (!submitResponse.ok) {
         const errorText = await submitResponse.text();
+        const friendlyError = parseErrorMessage(errorText, submitResponse.status, "Gitee");
         error("Gitee", `图片编辑（异步）API 错误: ${submitResponse.status}`);
-        logImageGenerationFailed("Gitee", requestId, errorText);
+        logImageGenerationFailed("Gitee", requestId, friendlyError);
         logApiCallEnd("Gitee", apiType, false, Date.now() - startTime);
-        throw new Error(`Gitee Async Edit API Error (${submitResponse.status}): ${errorText}`);
+        throw new Error(friendlyError);
       }
 
       const submitData = await submitResponse.json();
@@ -675,10 +677,11 @@ async function handleGitee(
 
       if (!response.ok) {
         const errorText = await response.text();
+        const friendlyError = parseErrorMessage(errorText, response.status, "Gitee");
         error("Gitee", `图片编辑 API 错误: ${response.status}`);
-        logImageGenerationFailed("Gitee", requestId, errorText);
+        logImageGenerationFailed("Gitee", requestId, friendlyError);
         logApiCallEnd("Gitee", apiType, false, Date.now() - startTime);
-        throw new Error(`Gitee Edit API Error (${response.status}): ${errorText}`);
+        throw new Error(friendlyError);
       }
 
       const data = await response.json();
@@ -736,11 +739,11 @@ async function handleGitee(
 
     if (!response.ok) {
       const errorText = await response.text();
-      const err = new Error(`Gitee API Error (${response.status}): ${errorText}`);
+      const friendlyError = parseErrorMessage(errorText, response.status, "Gitee");
       error("Gitee", `文生图 API 错误: ${response.status}`);
-      logImageGenerationFailed("Gitee", requestId, errorText);
+      logImageGenerationFailed("Gitee", requestId, friendlyError);
       logApiCallEnd("Gitee", apiType, false, Date.now() - startTime);
-      throw err;
+      throw new Error(friendlyError);
     }
 
     // 同步 API 直接返回结果
@@ -897,10 +900,10 @@ async function handleModelScope(
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
-    const err = new Error(`ModelScope Submit Error (${submitResponse.status}): ${errorText}`);
-    logImageGenerationFailed("ModelScope", requestId, errorText);
+    const friendlyError = parseErrorMessage(errorText, submitResponse.status, "ModelScope");
+    logImageGenerationFailed("ModelScope", requestId, friendlyError);
     logApiCallEnd("ModelScope", apiType, false, Date.now() - startTime);
-    throw err;
+    throw new Error(friendlyError);
   }
 
   const submitData = await submitResponse.json();
@@ -1448,7 +1451,8 @@ async function pollinationsGenerateImage(
   
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Pollinations API 错误 (${response.status}): ${errorText}`);
+    const friendlyError = parseErrorMessage(errorText, response.status, "Pollinations");
+    throw new Error(friendlyError);
   }
   
   // GET 端点直接返回图片二进制，转换为 Base64
@@ -1490,7 +1494,42 @@ async function pollinationsImageEdit(
   
   // 使用 GET /image 端点，通过 image 参数传递图片 URL
   // 多张图片用 | 分隔
-  const imageParam = images.join("|");
+  // ⚠️ 重要：检查图片参数长度，如果包含 Base64 则先上传到图床
+  const processedImageUrls: string[] = [];
+  
+  for (const img of images) {
+    if (img.startsWith("data:image/")) {
+      // Base64 图片：上传到图床获取短 URL
+      warn("Pollinations", "检测到 Base64 图片，正在上传到图床以避免 URL 过长...");
+      try {
+        const shortUrl = await base64ToUrl(img);
+        processedImageUrls.push(shortUrl);
+        info("Pollinations", `✅ Base64 图片已转换为短 URL: ${shortUrl.substring(0, 60)}...`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        error("Pollinations", `❌ 图片上传失败: ${msg}`);
+        throw new Error("图片处理失败：无法上传到图床。请使用较小的图片或直接提供图片 URL。");
+      }
+    } else if (img.startsWith("http")) {
+      // 已经是 URL，直接使用
+      processedImageUrls.push(img);
+    } else {
+      // 纯 Base64（无前缀）：添加前缀后上传
+      warn("Pollinations", "检测到纯 Base64 图片，正在上传到图床...");
+      try {
+        const dataUri = `data:image/png;base64,${img}`;
+        const shortUrl = await base64ToUrl(dataUri);
+        processedImageUrls.push(shortUrl);
+        info("Pollinations", `✅ 纯 Base64 图片已转换为短 URL`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        error("Pollinations", `❌ 图片上传失败: ${msg}`);
+        throw new Error("图片处理失败：无法上传到图床。请使用较小的图片或直接提供图片 URL。");
+      }
+    }
+  }
+  
+  const imageParam = processedImageUrls.join("|");
   
   const encodedPrompt = encodeURIComponent(prompt);
   const url = `${PollinationsConfig.apiUrl}${PollinationsConfig.imageEndpoint}/${encodedPrompt}`;
@@ -1529,7 +1568,8 @@ async function pollinationsImageEdit(
   
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Pollinations API 错误 (${response.status}): ${errorText}`);
+    const friendlyError = parseErrorMessage(errorText, response.status, "Pollinations");
+    throw new Error(friendlyError);
   }
   
   // GET 端点直接返回图片二进制，转换为 Base64
@@ -1600,7 +1640,7 @@ async function handlePollinations(
   }
 }
 
-async function handleChatCompletions(req: Request): Promise<Response> {
+async function handleImagesGenerations(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const requestId = generateRequestId();
 
@@ -1659,6 +1699,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         break;
       case "HuggingFace":
         imageContent = await handleHuggingFace(apiKey, chatRequest, prompt, images, requestId);
+        break;
+      case "Pollinations":
+        imageContent = await handlePollinations(apiKey, chatRequest, prompt, images, requestId);
         break;
     }
 
@@ -1761,15 +1804,24 @@ async function handleImagesEdits(req: Request): Promise<Response> {
       const model = formData.get("model") as string || undefined;
       const size = formData.get("size") as string || undefined;
       
-      // 提取图片文件
-      const imageFile = formData.get("image");
-      if (imageFile && imageFile instanceof File) {
-        const arrayBuffer = await imageFile.arrayBuffer();
-        const uint8Array = new Uint8Array(arrayBuffer);
-        const base64 = encodeBase64(uint8Array);
-        const mimeType = imageFile.type || "image/png";
-        images.push(`data:${mimeType};base64,${base64}`);
-        info("HTTP", `从 multipart/form-data 提取图片: ${imageFile.name}, 大小: ${Math.round(uint8Array.length / 1024)}KB`);
+      // 提取图片文件（优先使用 image[]，兼容 image）
+      const imageFiles: (File | string)[] = formData.getAll("image[]");
+      if (imageFiles.length === 0) {
+        const singleImage = formData.get("image");
+        if (singleImage) {
+          imageFiles.push(singleImage);
+        }
+      }
+
+      for (const imageFile of imageFiles) {
+        if (imageFile instanceof File) {
+          const arrayBuffer = await imageFile.arrayBuffer();
+          const uint8Array = new Uint8Array(arrayBuffer);
+          const base64 = encodeBase64(uint8Array);
+          const mimeType = imageFile.type || "image/png";
+          images.push(`data:${mimeType};base64,${base64}`);
+          info("HTTP", `从 multipart/form-data 提取图片: ${imageFile.name}, 大小: ${Math.round(uint8Array.length / 1024)}KB`);
+        }
       }
 
       requestBody = {
@@ -1780,23 +1832,45 @@ async function handleImagesEdits(req: Request): Promise<Response> {
       };
       
     } else {
-      // 处理 JSON 格式（非标准，但兼容性处理）
+      // 处理 JSON 格式（支持标准 Images Edit 格式和 Chat Completions 格式）
       const jsonBody = await req.json();
-      prompt = jsonBody.prompt || "";
       
-      // 从 JSON 中提取图片（可能是 Base64 字符串）
-      if (jsonBody.image) {
-        if (typeof jsonBody.image === "string") {
-          images.push(jsonBody.image);
+      // 优先从 messages 数组中提取（Chat Completions 格式）
+      if (jsonBody.messages && Array.isArray(jsonBody.messages)) {
+        // 标准化消息格式（处理 Cherry Studio 等非标准格式）
+        const normalizedMessages = jsonBody.messages.map((msg: Message) => ({
+          ...msg,
+          content: normalizeMessageContent(msg.content)
+        }));
+        
+        const { prompt: extractedPrompt, images: extractedImages } = extractPromptAndImages(normalizedMessages);
+        prompt = extractedPrompt;
+        images.push(...extractedImages);
+        
+        requestBody = {
+          model: jsonBody.model,
+          messages: normalizedMessages,
+          stream: false,
+          size: jsonBody.size,
+        };
+      } else {
+        // 标准 Images Edit 格式
+        prompt = jsonBody.prompt || "";
+        
+        // 从 JSON 中提取图片（可能是 Base64 字符串）
+        if (jsonBody.image) {
+          if (typeof jsonBody.image === "string") {
+            images.push(jsonBody.image);
+          }
         }
+        
+        requestBody = {
+          model: jsonBody.model,
+          messages: [{ role: "user", content: prompt }],
+          stream: false,
+          size: jsonBody.size,
+        };
       }
-      
-      requestBody = {
-        model: jsonBody.model,
-        messages: [{ role: "user", content: prompt }],
-        stream: false,
-        size: jsonBody.size,
-      };
     }
     
     debug("Router", `Images Edit API Prompt: ${prompt.substring(0, 80)}... (完整长度: ${prompt.length})`);
@@ -1816,6 +1890,9 @@ async function handleImagesEdits(req: Request): Promise<Response> {
         break;
       case "HuggingFace":
         imageContent = await handleHuggingFace(apiKey, requestBody, prompt, images, requestId);
+        break;
+      case "Pollinations":
+        imageContent = await handlePollinations(apiKey, requestBody, prompt, images, requestId);
         break;
     }
 
