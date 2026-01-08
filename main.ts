@@ -27,7 +27,14 @@ interface ImageUrlContentItem {
   image_url?: { url: string };
 }
 
-type MessageContentItem = TextContentItem | ImageUrlContentItem;
+// 支持非标准格式（如 Cherry Studio）
+interface NonStandardImageContentItem {
+  type: "image";
+  image: string;  // 纯 Base64 数据（无前缀）
+  mediaType?: string;  // 例如 "image/png"
+}
+
+type MessageContentItem = TextContentItem | ImageUrlContentItem | NonStandardImageContentItem;
 
 interface Message {
   role: string;
@@ -39,6 +46,28 @@ interface ChatRequest {
   messages: Message[];
   stream?: boolean;
   size?: string;
+  [key: string]: unknown;
+}
+
+/** OpenAI Images API 请求格式 */
+interface ImagesRequest {
+  model?: string;
+  prompt: string;
+  n?: number;
+  size?: string;
+  response_format?: "url" | "b64_json";
+  [key: string]: unknown;
+}
+
+/** OpenAI Images Edit API 请求格式 */
+interface ImagesEditRequest {
+  model?: string;
+  prompt: string;
+  image: File | Blob | string;  // 支持 File、Blob 或 Base64 字符串
+  mask?: File | Blob | string;  // 可选的遮罩
+  n?: number;
+  size?: string;
+  response_format?: "url" | "b64_json";
   [key: string]: unknown;
 }
 
@@ -68,6 +97,43 @@ function detectProvider(apiKey: string): Provider {
 
   logProviderRouting("Unknown", apiKey.substring(0, 4));
   return "Unknown";
+}
+
+/**
+ * 标准化消息内容格式：将所有非标准图片格式转换为标准 OpenAI 格式
+ * 这是"一劳永逸"的入口转换函数，支持：
+ * - Cherry Studio 格式：{type:"image", image:"base64", mediaType:"image/png"}
+ * - 其他未来可能出现的非标准格式
+ */
+function normalizeMessageContent(content: string | MessageContentItem[]): string | MessageContentItem[] {
+  if (typeof content === "string") {
+    return content;
+  }
+  
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  
+  // 转换数组中的每个内容项
+  return content.map((item: MessageContentItem) => {
+    // 处理 Cherry Studio 等非标准图片格式
+    if (item.type === "image" && "image" in item) {
+      const nonStdItem = item as NonStandardImageContentItem;
+      const mimeType = nonStdItem.mediaType || "image/png";
+      const base64Data = nonStdItem.image;
+      
+      // 转换为标准 OpenAI 格式
+      return {
+        type: "image_url",
+        image_url: {
+          url: `data:${mimeType};base64,${base64Data}`
+        }
+      } as ImageUrlContentItem;
+    }
+    
+    // 已经是标准格式，直接返回
+    return item;
+  });
 }
 
 function extractPromptAndImages(messages: Message[]): { prompt: string; images: string[] } {
@@ -682,18 +748,27 @@ async function handleGitee(
     const duration = Date.now() - startTime;
     logImageGenerationComplete("Gitee", requestId, imageData.length, duration);
 
-    // 构建返回结果（优先使用 Base64 嵌入）
-    const results = imageData.map((img: { url?: string; b64_json?: string }) => {
+    // 构建返回结果（优先使用 Base64 嵌入，URL 也转换为 Base64）
+    const results = await Promise.all(imageData.map(async (img: { url?: string; b64_json?: string }) => {
       if (img.b64_json) {
         return `![Generated Image](data:image/png;base64,${img.b64_json})`;
       } else if (img.url) {
-        return `![Generated Image](${img.url})`;
+        // 将 URL 转换为 Base64 以确保永久保存
+        try {
+          info("Gitee", `正在将 URL 转换为 Base64 以供永久保存...`);
+          const { base64, mimeType } = await urlToBase64(img.url);
+          return `![Generated Image](data:${mimeType};base64,${base64})`;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          warn("Gitee", `URL 转换 Base64 失败，回退到 URL: ${msg}`);
+          return `![Generated Image](${img.url})`;
+        }
       }
       return "";
-    }).filter(Boolean);
+    }));
 
     logApiCallEnd("Gitee", apiType, true, duration);
-    return results.join("\n\n") || "图片生成失败";
+    return results.filter(Boolean).join("\n\n") || "图片生成失败";
   }
 }
 
@@ -824,7 +899,7 @@ async function handleModelScope(
   const taskId = submitData.task_id;
   info("ModelScope", `任务已提交, Task ID: ${taskId}`);
 
-  const maxAttempts = 60;
+  const maxAttempts = 120; // 10分钟超时 (120次 × 5秒)
   let pollingAttempts = 0;
   
   for (let i = 0; i < maxAttempts; i++) {
@@ -840,11 +915,18 @@ async function handleModelScope(
     });
 
     if (!checkResponse.ok) {
-      warn("ModelScope", `轮询警告: ${checkResponse.status}`);
+      const errorText = await checkResponse.text();
+      warn("ModelScope", `轮询失败 (${checkResponse.status}): ${errorText}`);
       continue;
     }
 
     const checkData = await checkResponse.json();
+    
+    // 🔍 调试：输出完整响应以诊断问题
+    if (pollingAttempts <= 3 || pollingAttempts % 10 === 0) {
+      info("ModelScope", `📊 轮询响应 (第${pollingAttempts}次): ${JSON.stringify(checkData).substring(0, 200)}`);
+    }
+    
     const status = checkData.task_status;
 
     if (status === "SUCCEED") {
@@ -1310,27 +1392,286 @@ function extractImageUrlFromSSE(sseStream: string, baseUrl?: string): string | n
   return null;
 }
 
-async function handleChatCompletions(req: Request): Promise<Response> {
+/** 处理 /v1/images/generations 端点 */
+async function handleImagesGenerations(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const requestId = generateRequestId();
 
   logRequestStart(req, requestId);
 
-  if (url.pathname === "/" || url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok", service: "img-router" }), {
-      status: 200,
+  const authHeader = req.headers.get("Authorization");
+  const apiKey = authHeader?.replace("Bearer ", "").trim();
+  
+  if (!apiKey) {
+    warn("HTTP", "Authorization header 缺失");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "missing auth");
+    return new Response(JSON.stringify({ error: "Authorization header missing" }), {
+      status: 401,
       headers: { "Content-Type": "application/json" }
     });
   }
 
-  if (url.pathname !== "/v1/chat/completions") {
-    warn("HTTP", `路由不匹配: ${url.pathname}`);
-    await logRequestEnd(requestId, req.method, url.pathname, 404, 0);
-    return new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
+  const provider = detectProvider(apiKey);
+  if (provider === "Unknown") {
+    warn("HTTP", "API Key 格式无法识别");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "invalid key");
+    return new Response(JSON.stringify({ error: "Invalid API Key format. Could not detect provider." }), {
+      status: 401,
       headers: { "Content-Type": "application/json" }
     });
   }
+
+  info("HTTP", `路由到 ${provider}`);
+
+  try {
+    const requestBody: ImagesRequest = await req.json();
+    const prompt = requestBody.prompt || "";
+    const images: string[] = [];
+    
+    debug("Router", `Images API Prompt: ${prompt.substring(0, 80)}... (完整长度: ${prompt.length})`);
+
+    let imageContent = "";
+    
+    // 将 ImagesRequest 转换为 ChatRequest 格式以复用现有处理函数
+    const chatRequest: ChatRequest = {
+      model: requestBody.model,
+      messages: [{ role: "user", content: prompt }],
+      stream: false,
+      size: requestBody.size,
+    };
+    
+    switch (provider) {
+      case "VolcEngine":
+        imageContent = await handleVolcEngine(apiKey, chatRequest, prompt, images, requestId);
+        break;
+      case "Gitee":
+        imageContent = await handleGitee(apiKey, chatRequest, prompt, images, requestId);
+        break;
+      case "ModelScope":
+        imageContent = await handleModelScope(apiKey, chatRequest, prompt, images, requestId);
+        break;
+      case "HuggingFace":
+        imageContent = await handleHuggingFace(apiKey, chatRequest, prompt, images, requestId);
+        break;
+    }
+
+    const startTime = Date.now();
+    
+    // 从 Markdown 格式提取图片 URL 或 Base64
+    const imageMatches = imageContent.matchAll(/!\[.*?\]\(((?:https?:\/\/|data:image\/)[^\)]+)\)/g);
+    const imageDataArray = [];
+    
+    for (const match of imageMatches) {
+      const imageUrl = match[1];
+      if (imageUrl.startsWith("data:image/")) {
+        // Base64 格式
+        const base64Data = imageUrl.split(",")[1];
+        imageDataArray.push({
+          b64_json: base64Data
+        });
+      } else {
+        // URL 格式
+        imageDataArray.push({
+          url: imageUrl
+        });
+      }
+    }
+
+    // 返回 OpenAI Images API 格式
+    const responseBody = JSON.stringify({
+      created: Math.floor(Date.now() / 1000),
+      data: imageDataArray
+    });
+
+    info("HTTP", `响应完成 (Images API)`);
+    await logRequestEnd(requestId, req.method, url.pathname, 200, Date.now() - startTime);
+
+    return new Response(responseBody, {
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Internal Server Error";
+    const errorProvider = provider || "Unknown";
+    
+    error("Proxy", `请求处理错误 (${errorProvider}): ${errorMessage}`);
+    await logRequestEnd(requestId, req.method, url.pathname, 500, 0, errorMessage);
+    
+    return new Response(JSON.stringify({
+      error: { message: errorMessage, type: "server_error", provider: errorProvider }
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+}
+
+/** 处理 /v1/images/edits 端点 */
+async function handleImagesEdits(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const requestId = generateRequestId();
+
+  logRequestStart(req, requestId);
+
+  const authHeader = req.headers.get("Authorization");
+  const apiKey = authHeader?.replace("Bearer ", "").trim();
+  
+  if (!apiKey) {
+    warn("HTTP", "Authorization header 缺失");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "missing auth");
+    return new Response(JSON.stringify({ error: "Authorization header missing" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const provider = detectProvider(apiKey);
+  if (provider === "Unknown") {
+    warn("HTTP", "API Key 格式无法识别");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "invalid key");
+    return new Response(JSON.stringify({ error: "Invalid API Key format. Could not detect provider." }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  info("HTTP", `路由到 ${provider} (图片编辑)`);
+
+  try {
+    // 解析 multipart/form-data 或 JSON
+    const contentType = req.headers.get("content-type") || "";
+    let prompt = "";
+    const images: string[] = [];
+    let requestBody: ChatRequest;
+
+    if (contentType.includes("multipart/form-data")) {
+      // 处理 multipart/form-data 格式
+      const formData = await req.formData();
+      prompt = formData.get("prompt") as string || "";
+      const model = formData.get("model") as string || undefined;
+      const size = formData.get("size") as string || undefined;
+      
+      // 提取图片文件
+      const imageFile = formData.get("image");
+      if (imageFile && imageFile instanceof File) {
+        const arrayBuffer = await imageFile.arrayBuffer();
+        const uint8Array = new Uint8Array(arrayBuffer);
+        const base64 = encodeBase64(uint8Array);
+        const mimeType = imageFile.type || "image/png";
+        images.push(`data:${mimeType};base64,${base64}`);
+        info("HTTP", `从 multipart/form-data 提取图片: ${imageFile.name}, 大小: ${Math.round(uint8Array.length / 1024)}KB`);
+      }
+
+      requestBody = {
+        model,
+        messages: [{ role: "user", content: prompt }],
+        stream: false,
+        size,
+      };
+      
+    } else {
+      // 处理 JSON 格式（非标准，但兼容性处理）
+      const jsonBody = await req.json();
+      prompt = jsonBody.prompt || "";
+      
+      // 从 JSON 中提取图片（可能是 Base64 字符串）
+      if (jsonBody.image) {
+        if (typeof jsonBody.image === "string") {
+          images.push(jsonBody.image);
+        }
+      }
+      
+      requestBody = {
+        model: jsonBody.model,
+        messages: [{ role: "user", content: prompt }],
+        stream: false,
+        size: jsonBody.size,
+      };
+    }
+    
+    debug("Router", `Images Edit API Prompt: ${prompt.substring(0, 80)}... (完整长度: ${prompt.length})`);
+    debug("Router", `Images count: ${images.length}`);
+
+    let imageContent = "";
+    
+    switch (provider) {
+      case "VolcEngine":
+        imageContent = await handleVolcEngine(apiKey, requestBody, prompt, images, requestId);
+        break;
+      case "Gitee":
+        imageContent = await handleGitee(apiKey, requestBody, prompt, images, requestId);
+        break;
+      case "ModelScope":
+        imageContent = await handleModelScope(apiKey, requestBody, prompt, images, requestId);
+        break;
+      case "HuggingFace":
+        imageContent = await handleHuggingFace(apiKey, requestBody, prompt, images, requestId);
+        break;
+    }
+
+    const startTime = Date.now();
+    
+    // 从 Markdown 格式提取图片 URL 或 Base64
+    const imageMatches = imageContent.matchAll(/!\[.*?\]\(((?:https?:\/\/|data:image\/)[^\)]+)\)/g);
+    const imageDataArray = [];
+    
+    for (const match of imageMatches) {
+      const imageUrl = match[1];
+      if (imageUrl.startsWith("data:image/")) {
+        // Base64 格式
+        const base64Data = imageUrl.split(",")[1];
+        imageDataArray.push({
+          b64_json: base64Data
+        });
+      } else {
+        // URL 格式
+        imageDataArray.push({
+          url: imageUrl
+        });
+      }
+    }
+
+    // 返回 OpenAI Images API 格式
+    const responseBody = JSON.stringify({
+      created: Math.floor(Date.now() / 1000),
+      data: imageDataArray
+    });
+
+    info("HTTP", `响应完成 (Images Edit API)`);
+    await logRequestEnd(requestId, req.method, url.pathname, 200, Date.now() - startTime);
+
+    return new Response(responseBody, {
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Internal Server Error";
+    const errorProvider = provider || "Unknown";
+    
+    error("Proxy", `请求处理错误 (${errorProvider}): ${errorMessage}`);
+    await logRequestEnd(requestId, req.method, url.pathname, 500, 0, errorMessage);
+    
+    return new Response(JSON.stringify({
+      error: { message: errorMessage, type: "server_error", provider: errorProvider }
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+}
+
+/** 处理 /v1/chat/completions 端点 */
+async function handleChatCompletions(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const requestId = generateRequestId();
+
+  logRequestStart(req, requestId);
 
   const authHeader = req.headers.get("Authorization");
   const apiKey = authHeader?.replace("Bearer ", "").trim();
@@ -1358,6 +1699,15 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
   try {
     const requestBody: ChatRequest = await req.json();
+    
+    // 🎯 一劳永逸：统一标准化所有消息格式
+    if (requestBody.messages && Array.isArray(requestBody.messages)) {
+      requestBody.messages = requestBody.messages.map(msg => ({
+        ...msg,
+        content: normalizeMessageContent(msg.content)
+      }));
+    }
+    
     const isStream = requestBody.stream === true;
     const { prompt, images } = extractPromptAndImages(requestBody.messages || []);
 
@@ -1470,6 +1820,37 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   }
 }
 
+/** 主路由函数：根据路径分发到对应的处理函数 */
+async function handleRequest(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  
+  // 健康检查端点
+  if (url.pathname === "/" || url.pathname === "/health") {
+    return new Response(JSON.stringify({
+      status: "ok",
+      service: "img-router",
+      endpoints: ["/v1/chat/completions", "/v1/images/generations", "/v1/images/edits"]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+  
+  // 路由到对应的处理函数
+  if (url.pathname === "/v1/chat/completions") {
+    return await handleChatCompletions(req);
+  } else if (url.pathname === "/v1/images/generations") {
+    return await handleImagesGenerations(req);
+  } else if (url.pathname === "/v1/images/edits") {
+    return await handleImagesEdits(req);
+  } else {
+    return new Response(JSON.stringify({ error: "Not found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+}
+
 /** 读取版本号 */
 async function getVersion(): Promise<string> {
   try {
@@ -1492,6 +1873,7 @@ const version = await getVersion();
 info("Startup", `🚀 服务启动端口 ${PORT}`);
 info("Startup", `📦 版本: ${version}`);
 info("Startup", "🔧 支持: 火山引擎, Gitee, ModelScope, HuggingFace");
+info("Startup", "📡 端点: /v1/chat/completions, /v1/images/generations, /v1/images/edits");
 info("Startup", `📁 日志目录: ./data/logs`);
 
 Deno.addSignalListener("SIGINT", async () => {
@@ -1511,11 +1893,25 @@ if (Deno.build.os !== "windows") {
 }
 
 Deno.serve({ port: PORT }, (req: Request) => {
+  const url = new URL(req.url);
+  
+  // 健康检查端点允许 GET 请求
+  if ((url.pathname === "/" || url.pathname === "/health") && req.method === "GET") {
+    return new Response(JSON.stringify({
+      status: "ok",
+      service: "img-router",
+      endpoints: ["/v1/chat/completions", "/v1/images/generations", "/v1/images/edits"]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+  
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Access-Control-Max-Age": "86400",
       }
@@ -1527,5 +1923,5 @@ Deno.serve({ port: PORT }, (req: Request) => {
     return new Response("Method Not Allowed", { status: 405 });
   }
 
-  return handleChatCompletions(req);
+  return handleRequest(req);
 });

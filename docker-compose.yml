@@ -8,12 +8,8 @@ services:
     environment:
       - PORT=10001
     restart: always
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:10001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+    # 健康检查已禁用 - Deno 镜像不包含 wget/curl
+    # 如需启用，请在 Dockerfile 中安装 curl 或使用 Deno 的 fetch API
     volumes:
       - ./data:/app/data
 

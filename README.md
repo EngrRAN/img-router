@@ -11,9 +11,10 @@
 
 - **智能路由** - 根据 API Key 格式自动识别并分发到对应渠道
 - **多渠道支持** - 火山引擎、Gitee (模力方舟)、ModelScope (魔搭)、Hugging Face
-- **OpenAI 兼容** - 完全兼容 `/v1/chat/completions` 接口格式
+- **OpenAI 完全兼容** - 支持 `/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits` 接口
 - **流式响应** - 支持 SSE 流式输出
 - **文生图 & 图生图** - 支持纯文字生成图片，也支持上传参考图片进行图片编辑
+- **智能图片处理** - 自动标准化图片格式，支持非标准格式转换
 - **Base64 永久保存** - 所有生成的图片自动转换为 Base64 返回，永久有效
 - **故障转移** - HuggingFace 渠道支持多 URL 资源池自动切换
 - **Docker 部署** - 开箱即用的容器化部署方案
@@ -75,6 +76,28 @@
 **图片返回方式：**
 - 所有渠道生成的图片都会自动转换为 **Base64 格式**返回
 - Base64 嵌入在 Markdown 图片语法中，永久有效，无需担心链接过期
+
+## API 端点
+
+### 1. Chat Completions (推荐)
+```
+POST /v1/chat/completions
+```
+通过对话方式生成图片，支持文生图和图生图。
+
+### 2. Images Generations (OpenAI 标准)
+```
+POST /v1/images/generations
+```
+标准的 OpenAI 图片生成接口，用于文生图。
+
+### 3. Images Edits (OpenAI 标准)
+```
+POST /v1/images/edits
+```
+标准的 OpenAI 图片编辑接口，用于图生图。
+
+> 💡 **提示**: 三个端点功能相同，可根据使用习惯选择。Chat Completions 接口更灵活，支持流式输出。
 
 ## 快速开始
 
